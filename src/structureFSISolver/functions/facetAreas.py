@@ -36,9 +36,11 @@
 #%% Import packages
 #_________________________________________________________________________________________
 from dolfinx import *
+from dolfinx.cpp.mesh import entities_to_geometry
 import ufl
 from ufl import (FacetArea)
 import numpy as np
+from mpi4py import MPI
 import math
 import scipy as sp
 from scipy import spatial as sp_spatial
@@ -82,47 +84,61 @@ class facetAreas:
                                      FunctionSpace,
                                      dofs_fetch_list,
                                      dimension):
-        areatotal = 0.0
-        dofs2coord = FunctionSpace.tabulate_dof_coordinates()
-        boundary_facets = mesh.locate_entities_boundary(domain, dim=(domain.topology.dim-1), marker=self.subDomains.Flex)
+        comm = domain.comm
+        tdim = domain.topology.dim
+        fdim = tdim - 1
+        domain.topology.create_connectivity(fdim, tdim)
+        domain.topology.create_connectivity(tdim, fdim)
+        # Ensure connectivity exists
+        domain.topology.create_connectivity(fdim, tdim)
+        # Get locally owned exterior facets
+        facets = mesh.exterior_facet_indices(domain.topology)
+        imap = domain.topology.index_map(fdim)
+        facets = facets[facets < imap.size_local]
+        # Call once
+        facet_dofs = fem.locate_dofs_topological(
+            FunctionSpace, fdim, facets
+        )
+        # Map facets to geometry (vertex indices)
+        geom_dofs = entities_to_geometry(domain._cpp_object, fdim, facets, False)
+        geom = domain.geometry.x
+        
+        for facet, vertices in zip(facets, geom_dofs):
+            coords = geom[vertices]
+            if dimension == 2:
+                # Edge length
+                pa, pb = coords
+                area = np.linalg.norm(pb - pa)
 
-        for i, p in enumerate(boundary_facets):
-            coord_list=[]
-            d_list=[]
-            area_list=[]
-            dofs = fem.locate_dofs_topological(V=FunctionSpace, entity_dim=(domain.topology.dim-1), entities=np.array([p]))
-            ndofs = len(dofs)
-            print("Facet dofs at ", p, " = ", dofs)
-            for ii, pp in enumerate(dofs):
-                coord_list.append(dofs2coord[pp])
-            # Add a small perturbation to avoid collinearity issues
-            perturbation = 1e-6 * self.find_smallest_distance(coord_list)
-            perturbed_points = np.array(coord_list) + np.random.uniform(-perturbation, perturbation, size=np.array(coord_list).shape)
-            # Calculate the convex hull
-            hull = ConvexHull(perturbed_points)
-            # Calculate the total area
-            areaPdof = 0
-            for simplex in hull.simplices:
-                triangle = perturbed_points[simplex]
-                areaPdof += self.calculate_area(triangle[0], triangle[1], triangle[2])
-            areaPdof *= (0.5 * self.areaListFactor())
-            print("Facet total area ", areaPdof)
-            if (ndofs != 0):
-                areaPdof /= float(ndofs)
+            elif dimension == 3:
+                # Triangle area
+                pa, pb, pc = coords
+                area = 0.5 * np.linalg.norm(np.cross(pb - pa, pc - pa))
+
             else:
-                areaPdof = 0.0
-            for ii, pp in enumerate(dofs):
-                if pp in dofs_fetch_list:
-                    d_list.append(pp)
-                    area_list.append(areaPdof)
-            if (len(d_list)!=0):
-                for iii, ppp in enumerate(d_list):
-                    self.areaf_vec[ppp] += area_list[iii]
-        
+                raise RuntimeError("Unsupported dimension")
+
+            ndofs = len(facet_dofs)
+            if ndofs > 0:
+                area_per_dof = area / ndofs
+            else:
+                continue
+
+            for dof in facet_dofs:
+                if dof in dofs_fetch_list:
+                    self.areaf_vec[dof] += area_per_dof
+
+        # Synchronise all ranks
+        domain.comm.Barrier()
+        # Finalise parallel accumulation
+        # Compute total area safely
+        local_sum = 0.0
+
         for iii, ppp in enumerate(self.areaf_vec):
-            areatotal += self.areaf_vec[iii]
-        
-        if (self.rank == 0) and self.iDebug():
+            local_sum += self.areaf_vec[iii]
+        areatotal = comm.allreduce(local_sum, op=MPI.SUM)
+
+        if self.rank == 0 and self.iDebug():
             print("Total area of MUI fetched surface= ", areatotal, " m^2")
 
     def facets_area_define(self,
